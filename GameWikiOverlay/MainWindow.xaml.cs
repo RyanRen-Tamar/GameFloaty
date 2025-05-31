@@ -3,6 +3,7 @@ using Microsoft.Web.WebView2.Wpf;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -12,10 +13,16 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Threading;
+using System.Net;
+using System.Threading.Tasks;
+using System.Net.Http;
+using System.Diagnostics;
 
 namespace GameWikiTooltip
 {
-    // 用于反序列化 games.json
+    public record AdkRequest(string userId, string conversationId, string query, Dictionary<string, string> context = null);
+    public record AdkResponse(string response, string conversationId, Dictionary<string, string> context = null);
+
     public class GameConfig
     {
         public string BaseUrl { get; set; }
@@ -23,7 +30,6 @@ namespace GameWikiTooltip
         public string SearchTemplate { get; set; }
         public Dictionary<string, string> KeywordMap { get; set; }
     }
-    // 对应 settings.json 结构
     public class HotkeyConfig
     {
         public string Key { get; set; }
@@ -33,8 +39,11 @@ namespace GameWikiTooltip
     {
         public HotkeyConfig Hotkey { get; set; }
         public PopupConfig Popup { get; set; }
+        // Future: Add voice settings here
+        // public bool EnableVoiceInput { get; set; } = true;
+        // public bool EnableVoiceOutput { get; set; } = true;
+        // public string AdkAgentUrl { get; set; } = "http://localhost:5005/invoke_agent";
     }
-    // games.json
     public class PopupConfig
     {
         public double Width { get; set; }
@@ -43,41 +52,45 @@ namespace GameWikiTooltip
         public double Top { get; set; }
     }
 
-    //
     public partial class MainWindow : Window
     {
-        private string _lastUrl;  // 记录上一次打开的 URL
-        private NotifyIcon _trayIcon; //托盘图标
+        // Original placeholder for a direct AI API key, currently unused if ADK flow is primary.
+        private string _aiApiKey = "YOUR_API_KEY_HERE";
+        private string _lastUrl;
+        private NotifyIcon _trayIcon;
         private int _hotkeyId = 9001;
         private AppSettings _settings;
         private Dictionary<string, GameConfig> _gameConfigs;
         private readonly string _userConfigDir;
         private readonly string _userSettingsPath;
-        // 新增：跟踪当前打开的内容浮窗
         private Window _currentContentPopup;
-        // 共享的 WebView2 环境
         private CoreWebView2Environment _sharedEnvironment;
+
+        private static readonly HttpClient httpClient = new HttpClient();
+        private string _currentConversationId = null;
+        private readonly string _userId = "user_test_001"; // Hardcoded user ID for ADK
+
+        // Voice Settings Placeholders.
+        // Future: These should be loaded from AppSettings/settings.json.
+        private bool _enableVoiceInput = true;
+        private bool _enableVoiceOutput = true;
+
+        // Future: This should be configurable, e.g., from AppSettings/settings.json.
+        private readonly string _adkAgentUrl = "http://localhost:5005/invoke_agent";
+
+
         [DllImport("user32.dll")]
         private static extern int ShowCursor(int bShow);
 
-        /// <summary>
-        /// 不断调用 ShowCursor(1) 直到内部计数 >= 0，使光标显示出来
-        /// </summary>
         private void ShowCursorUntilVisible()
         {
-            while (ShowCursor(1) < 0)
-            {
-                // keep calling
-            }
+            while (ShowCursor(1) < 0) { /* keep calling */ }
         }
 
         public MainWindow()
         {
             InitializeComponent();
-            // 1) 构造 AppData 下的配置目录和文件路径
-            _userConfigDir = Path.Combine(
-                                     Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                                     "GameWikiTooltip");
+            _userConfigDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "GameWikiTooltip");
             Directory.CreateDirectory(_userConfigDir);
             _userSettingsPath = Path.Combine(_userConfigDir, "settings.json");
             InitializeTrayIcon();
@@ -87,74 +100,58 @@ namespace GameWikiTooltip
             WarmUpWebView2();
             Loaded += MainWindow_Loaded;
         }
-        //浮窗预启动
         private async void WarmUpWebView2()
         {
-            // 创建共享环境（可自定义 UserDataFolder 等）
             _sharedEnvironment = await CoreWebView2Environment.CreateAsync();
-            // 隐藏的 WebView2 控件
             var hiddenView = new WebView2();
             await hiddenView.EnsureCoreWebView2Async(_sharedEnvironment);
-            // 加载一个空白或本地资源，保持环境“热”着
             hiddenView.CoreWebView2.Navigate("about:blank");
-            // 不要添加到可视树，直接丢掉引用即可
         }
-        //托盘初始化
         private void InitializeTrayIcon()
         {
-            _trayIcon = new NotifyIcon
-            {
-                Icon = new System.Drawing.Icon("app.ico"), // 你的图标文件
-                Visible = false,
-                Text = "Game Wiki Tooltip"
-            };
-            // 创建右键菜单
+            _trayIcon = new NotifyIcon { Visible = false, Text = "Game Wiki Tooltip" };
+            try { _trayIcon.Icon = new System.Drawing.Icon("app.ico"); } catch { /* Handle missing icon */ }
             var menu = new ContextMenuStrip();
             menu.Items.Add("设置", null, (s, e) => ShowSettingsWindow());
             menu.Items.Add("退出", null, (s, e) =>
             {
-                // 清理全局热键
+                if (_currentContentPopup != null) { _currentContentPopup.Close(); }
                 var handle = new WindowInteropHelper(this).Handle;
-                UnregisterHotKey(handle, _hotkeyId);
-
-                _trayIcon.Visible = false;
+                if(handle != IntPtr.Zero) UnregisterHotKey(handle, _hotkeyId);
+                if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); }
                 System.Windows.Application.Current.Shutdown();
             });
-            _trayIcon.ContextMenuStrip = menu;
-
+             _trayIcon.ContextMenuStrip = menu;
             _trayIcon.DoubleClick += (_, __) => ShowSettingsWindow();
         }
-
-        private void ShowSettingsWindow()
-        {
-            // 保证主窗口可见并激活
-            Show();
-            WindowState = WindowState.Normal;
-            Activate();
-            _trayIcon.Visible = false;
-        }
-
-        //最小化到脱盘// XAML: <Window … Closing="Window_Closing">
         private void Window_Closing(object sender, System.ComponentModel.CancelEventArgs e)
         {
             var result = System.Windows.MessageBox.Show(
-                "是要退出程序？点击“否”将最小化到托盘。",
-                "确认",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Question);
+                "是要退出程序？点击“否”将最小化到托盘。", "确认", MessageBoxButton.YesNo, MessageBoxImage.Question);
 
             if (result == MessageBoxResult.No)
             {
-                e.Cancel = true;    // 取消真正的关闭
-                Hide();             // 隐藏窗口
-                _trayIcon.Visible = true;
+                e.Cancel = true;
+                Hide();
+                if (_trayIcon != null) _trayIcon.Visible = true;
             }
-            // 如果是 Yes，就让窗口正常关闭，释放热键等资源
+            else
+            {
+                if (_currentContentPopup != null) { _currentContentPopup.Close(); }
+                var handle = new WindowInteropHelper(this).Handle;
+                if(handle != IntPtr.Zero) UnregisterHotKey(handle, _hotkeyId);
+                if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); }
+            }
         }
-        //“保存并应用热键”按钮
+        private void ShowSettingsWindow()
+        {
+            Show();
+            WindowState = WindowState.Normal;
+            Activate();
+            if (_trayIcon != null) _trayIcon.Visible = false;
+        }
         private void BtnSave_Click(object sender, RoutedEventArgs e)
         {
-            // 读取 UI 勾选框和下拉框的值到 _settings.Hotkey
             _settings.Hotkey.Modifiers = new[]
             {
                 chkCtrl.IsChecked == true ? "Ctrl" : null,
@@ -163,103 +160,97 @@ namespace GameWikiTooltip
                 chkWin.IsChecked == true ? "Win" : null
             }.Where(s => s != null).ToArray();
             _settings.Hotkey.Key = cmbKey.SelectedItem.ToString();
-            SaveSettings();              // 写回 settings.json
+            SaveSettings(); // Future: Save voice settings and ADK URL from UI to _settings here.
 
-            // 取消旧热键、注册新热键
             var handle = new WindowInteropHelper(this).Handle;
-            UnregisterHotKey(handle, _hotkeyId);
+            if(handle != IntPtr.Zero) UnregisterHotKey(handle, _hotkeyId);
             RegisterGlobalHotkey();
-            Hide();             // 隐藏窗口
-            _trayIcon.Visible = true;
 
-            // 设置气泡提示内容
-            _trayIcon.BalloonTipTitle = "Game Wiki Tooltip";
-            _trayIcon.BalloonTipText = "保存并应用成功！已最小化到系统托盘";
-            _trayIcon.BalloonTipIcon = ToolTipIcon.Info;
-
-            // 显示气泡提示，持续 3 秒（3000 毫秒）
-            Dispatcher.InvokeAsync(() => _trayIcon.ShowBalloonTip(3000),
-                       DispatcherPriority.ApplicationIdle);
+            Hide();
+            if (_trayIcon != null)
+            {
+                _trayIcon.Visible = true;
+                _trayIcon.BalloonTipTitle = "Game Wiki Tooltip";
+                _trayIcon.BalloonTipText = "保存并应用成功！已最小化到系统托盘";
+                try { _trayIcon.ShowBalloonTip(3000); } catch { /* Might fail if not Forms NotifyIcon */ }
+            }
         }
-
         private void RegisterGlobalHotkey()
         {
             var handle = new WindowInteropHelper(this).Handle;
+            if (handle == IntPtr.Zero) return; // Should not happen if window is loaded
             uint mods = 0;
             foreach (var m in _settings.Hotkey.Modifiers)
-                switch (m)
+                switch (m.ToLowerInvariant())
                 {
-                    case "Ctrl": mods |= 0x0002; break;
-                    case "Shift": mods |= 0x0004; break;
-                    case "Alt": mods |= 0x0001; break;
-                    case "Win": mods |= 0x0008; break;
+                    case "ctrl": mods |= 0x0002; break;
+                    case "shift": mods |= 0x0004; break;
+                    case "alt": mods |= 0x0001; break;
+                    case "win": mods |= 0x0008; break;
                 }
             uint vk = (uint)KeyInterop.VirtualKeyFromKey(Enum.Parse<Key>(_settings.Hotkey.Key));
-            RegisterHotKey(handle, _hotkeyId, mods, vk);
-            HwndSource.FromHwnd(handle).AddHook(WndProc);
+            if (!RegisterHotKey(handle, _hotkeyId, mods, vk))
+            {
+                System.Windows.MessageBox.Show("热键注册失败！可能已被其他程序占用。", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            HwndSource.FromHwnd(handle)?.AddHook(WndProc);
         }
-
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
-
         private void LoadSettingsIntoUI()
         {
-            chkCtrl.IsChecked = _settings.Hotkey.Modifiers.Contains("Ctrl");
-            chkShift.IsChecked = _settings.Hotkey.Modifiers.Contains("Shift");
-            chkAlt.IsChecked = _settings.Hotkey.Modifiers.Contains("Alt");
-            chkWin.IsChecked = _settings.Hotkey.Modifiers.Contains("Win");
+            // Future: Load voice and ADK URL settings into UI components
+            chkCtrl.IsChecked = _settings.Hotkey.Modifiers.Any(m => m.Equals("Ctrl", StringComparison.OrdinalIgnoreCase));
+            chkShift.IsChecked = _settings.Hotkey.Modifiers.Any(m => m.Equals("Shift", StringComparison.OrdinalIgnoreCase));
+            chkAlt.IsChecked = _settings.Hotkey.Modifiers.Any(m => m.Equals("Alt", StringComparison.OrdinalIgnoreCase));
+            chkWin.IsChecked = _settings.Hotkey.Modifiers.Any(m => m.Equals("Win", StringComparison.OrdinalIgnoreCase));
 
-            cmbKey.ItemsSource = Enum.GetValues(typeof(Key))
-                                    .Cast<Key>()
-                                    .Where(k => (k >= Key.F1 && k <= Key.F24) || (k >= Key.A && k <= Key.Z));
+            cmbKey.ItemsSource = Enum.GetValues(typeof(Key)).Cast<Key>()
+                                    .Where(k => (k >= Key.F1 && k <= Key.F24) || (k >= Key.A && k <= Key.Z) || (k >= Key.D0 && k <= Key.D9) || (k >= Key.NumPad0 && k <= Key.NumPad9));
             cmbKey.SelectedItem = Enum.TryParse<Key>(_settings.Hotkey.Key, true, out var k) ? k : Key.F12;
         }
-
-
-        //原有
         private void LoadSettings()
         {
-            // 如果 AppData 目录里已有用户配置，就直接读它
+            // Future: Extend AppSettings to include EnableVoiceInput, EnableVoiceOutput, AdkAgentUrl
+            // And deserialize them here. For now, using hardcoded defaults for those.
             if (File.Exists(_userSettingsPath))
             {
-                var json = File.ReadAllText(_userSettingsPath);
-                _settings = JsonSerializer.Deserialize<AppSettings>(json);
+                try { _settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(_userSettingsPath)); }
+                catch (JsonException) { LoadDefaultSettings(true); } // Overwrite corrupted
             }
-            else
-            {
-                // 否则，从程序目录的默认 settings.json 拷贝一份到 AppData
-                string defaultPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
-                if (File.Exists(defaultPath))
-                {
-                    File.Copy(defaultPath, _userSettingsPath);
-                    var json = File.ReadAllText(_userSettingsPath);
-                    _settings = JsonSerializer.Deserialize<AppSettings>(json);
-                }
-                else
-                {
-                    // 既没有用户文件，也没有默认文件，则用硬编码的默认
-                    _settings = new AppSettings
-                    {
-                        Hotkey = new HotkeyConfig { Key = "F", Modifiers = new[] { "Ctrl" } },
-                        Popup = new PopupConfig { Width = 800, Height = 600, Left = 100, Top = 100 }
-                    };
-                    // 并且写一份到 AppData
-                    SaveSettings();
-                }
-            }
+            else { LoadDefaultSettings(false); } // Create new if not exists
         }
-
+        private void LoadDefaultSettings(bool overwrite)
+        {
+            string defaultSettingsPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.default.json"); // Example default template
+            if (!overwrite && File.Exists(defaultSettingsPath))
+            {
+                try
+                {
+                    File.Copy(defaultSettingsPath, _userSettingsPath); // Copy template to user dir
+                    _settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(_userSettingsPath));
+                }
+                catch { _settings = GetHardcodedDefaultSettings(); SaveSettings(); }
+            }
+            else { _settings = GetHardcodedDefaultSettings(); SaveSettings(); } // Use hardcoded if template missing or overwrite needed
+        }
+        private AppSettings GetHardcodedDefaultSettings() => new AppSettings
+        {
+            Hotkey = new HotkeyConfig { Key = "F12", Modifiers = new[] { "Ctrl", "Shift" } },
+            Popup = new PopupConfig { Width = 800, Height = 600, Left = 100, Top = 100 }
+            // Voice settings and ADK URL will use class defaults for now.
+        };
         private void SaveSettings()
         {
-            var options = new JsonSerializerOptions { WriteIndented = true };
-            File.WriteAllText(_userSettingsPath, JsonSerializer.Serialize(_settings, options));
+            try { File.WriteAllText(_userSettingsPath, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull })); }
+            catch (Exception ex) { System.Windows.MessageBox.Show($"保存设置失败: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error); }
         }
-
         private void MainWindow_Loaded(object sender, RoutedEventArgs e)
         {
+            var interopHelper = new WindowInteropHelper(this);
+            if (interopHelper.Handle == IntPtr.Zero) interopHelper.EnsureHandle();
             RegisterGlobalHotkey();
         }
-
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
             const int WM_HOTKEY = 0x0312;
@@ -270,181 +261,170 @@ namespace GameWikiTooltip
             }
             return IntPtr.Zero;
         }
-        //wiki浮窗
+        private async Task<string> CaptureAndRecognizeScreenTextAsync()
+        {
+            await Task.Delay(50);
+            return "Simulated OCR result from dummy CaptureAndRecognizeScreenTextAsync method";
+        }
+
+        private async Task SimulatePlayTextAsSpeechAsync(string textToPlay)
+        {
+            // Future: Detect language of textToPlay or use user setting for bilingual TTS.
+            Debug.WriteLine($"[TTS SIMULATION] Playing: '{textToPlay}'");
+            await Task.Delay(TimeSpan.FromSeconds(1));
+        }
+
+        private async Task<string> GetAiResponseAsync(string userQuery, string ocrContextText)
+        {
+            if (string.IsNullOrWhiteSpace(userQuery)) return "Query cannot be empty.";
+            _currentConversationId = Guid.NewGuid().ToString();
+            var contextData = new Dictionary<string, string>();
+            if (!string.IsNullOrEmpty(ocrContextText)) contextData["screen_text"] = ocrContextText;
+
+            var requestPayload = new AdkRequest(_userId, _currentConversationId, userQuery, contextData.Count > 0 ? contextData : null);
+            string jsonRequest;
+            try { jsonRequest = JsonSerializer.Serialize(requestPayload); }
+            catch (JsonException ex) { return $"Error: Failed to serialize ADK request. {ex.Message}"; }
+
+            // Simulate HTTP call to ADK agent
+            // Future: ADK_AGENT_URL should be configurable, e.g., from AppSettings/settings.json.
+            // var targetUrl = _settings.AdkAgentUrl ?? _adkAgentUrl; // Prioritize settings
+            try
+            {
+                await Task.Delay(150); // Simulate network latency for httpClient.PostAsync(_adkAgentUrl, ...)
+                string simulatedJsonResponse;
+
+                if (userQuery.ToLowerInvariant() == "error_adk")
+                {
+                    // This specific string will be checked in ShowWikiWebPopup for special formatting.
+                    return $"ADK Agent Error: Simulated error processing the request for '{userQuery}'. ConvID: {_currentConversationId}";
+                }
+                else if (userQuery.ToLowerInvariant() == "error") // General non-ADK error
+                {
+                     return "Error: Simulated general error occurred while fetching the AI response.";
+                }
+                else
+                {
+                    string responseText = $"ADK Agent Mock Says: Your query was '{userQuery}'. ConvID: {_currentConversationId}.";
+                    if (requestPayload.context != null && requestPayload.context.TryGetValue("screen_text", out var screenText))
+                    {
+                        responseText += $" I see on your screen: '{screenText}'.";
+                    }
+                    var adkResponse = new AdkResponse(responseText, _currentConversationId, requestPayload.context);
+                    simulatedJsonResponse = JsonSerializer.Serialize(adkResponse);
+                }
+
+                AdkResponse deserializedResponse = JsonSerializer.Deserialize<AdkResponse>(simulatedJsonResponse);
+                if (deserializedResponse != null && !string.IsNullOrEmpty(deserializedResponse.response))
+                {
+                    _currentConversationId = deserializedResponse.conversationId;
+                    return deserializedResponse.response;
+                }
+                // This path might be hit if simulatedJsonResponse was an error JSON not matching AdkResponse structure.
+                return "ADK Error: Failed to deserialize valid ADK response or response was empty.";
+            }
+            catch (JsonException ex) { return $"JSON Error: Could not process ADK response. {ex.Message}"; }
+            catch (Exception ex) { return $"Error: An unexpected error occurred communicating with ADK. {ex.Message}"; }
+        }
+
         private async void ShowWikiWebPopup()
         {
-            // 1. 读前台窗口标题
+            // --- Game Configuration Check ---
             string title = GetActiveWindowTitle();
-
-            // 如果是 CS2 或 Valorant 且浮窗已存在，则呼出光标，不打开新窗口
-            if (_currentContentPopup != null
-                && (title.Contains("Counter-Strike 2", StringComparison.OrdinalIgnoreCase)
-                    || title.Contains("VALORANT", StringComparison.OrdinalIgnoreCase) 
-                    || title.Contains("三角洲行动", StringComparison.OrdinalIgnoreCase)))
-            {
-                ShowCursorUntilVisible();
-
-                // 如果浮窗被最小化，就恢复到正常窗口
-                if (_currentContentPopup.WindowState == WindowState.Minimized)
-                    _currentContentPopup.WindowState = WindowState.Normal;
-
-                _currentContentPopup.Activate();  // 聚焦已有浮窗
-                return;
-            }
-
-            // 2. 匹配游戏配置
             GameConfig cfg = null;
             foreach (var kv in _gameConfigs)
             {
-                if (title.Contains(kv.Key, StringComparison.OrdinalIgnoreCase))
-                {
-                    cfg = kv.Value;
-                    break;
-                }
+                if (title.Contains(kv.Key, StringComparison.OrdinalIgnoreCase)) { cfg = kv.Value; break; }
             }
-
             if (cfg == null)
             {
                 System.Windows.MessageBox.Show($"暂不支持游戏：{title}\n请在 games.json 添加条目。", "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
                 return;
             }
 
-            string url;
-            string input = null;
-            if (!cfg.NeedsSearch)
-            {
-                // 直接打开 baseUrl
-                url = cfg.BaseUrl;
-            }
-            else
-            {
-                // 弹出半透明的搜索框（使用你之前的 Prompt）
-                input = await Prompt.ShowDialogAsync("输入关键词…");
-                if (string.IsNullOrWhiteSpace(input)) return;
+            // --- Input Gathering (Prompt / Future STT) ---
+            // If _enableVoiceInput is true, Prompt.ShowDialogAsync could be replaced or augmented
+            // by a voice recognition step that populates 'input'.
+            // Future: if (_enableVoiceInput) { input = await RecognizeSpeechAsync(); } else { input = await Prompt.ShowDialogAsync(...); }
+            string input = await Prompt.ShowDialogAsync("输入AI查询或关键词…");
+            if (string.IsNullOrWhiteSpace(input)) return;
 
-                if (input == "<<LAST>>")
-                {
-                    if (_currentContentPopup != null)
-                    {
-                        _currentContentPopup.Activate();
-                        return;
-                    }
-                    if (string.IsNullOrEmpty(_lastUrl))
-                    {
-                        System.Windows.MessageBox.Show("没有上次搜索记录。");
-                        return;
-                    }
-                    url = _lastUrl;
-                }
-                else if (cfg.KeywordMap != null && cfg.KeywordMap.TryGetValue(input, out var mappedId))
-                {
-                    // 用映射到的 ID
-                    url = cfg.SearchTemplate
-                             .Replace("{baseUrl}", cfg.BaseUrl)
-                             .Replace("{id}", mappedId);
-                }
-                else
-                {
-                    // 用模板生成 URL
-                    string esc = Uri.EscapeDataString(input);
-                    url = cfg.SearchTemplate
-                        .Replace("{baseUrl}", cfg.BaseUrl)
-                        .Replace("{keyword}", esc); 
-                }
-            }
-            // 只有当这是一次“新”搜索或直接打开（!<<LAST>>），才替换旧的浮窗
-            if (_currentContentPopup != null)
+            if (input == "<<LAST>>")
             {
-                _currentContentPopup.Close();
-                _currentContentPopup = null;
-            }
-
-
-            // 先验证 URL 格式
-            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            {
-                System.Windows.MessageBox.Show($"无效的 URL：\n{url}", "URI 格式错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                if (_currentContentPopup != null) _currentContentPopup.Activate();
+                else System.Windows.MessageBox.Show("没有活动的AI查询弹窗。上次AI查询重放功能尚未实现。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            // 记录上次 URL
-            _lastUrl = uri.AbsoluteUri;
+            // --- Context Gathering (Future Screen Capture + OCR) ---
+            // string actualOcrText = await CaptureAndRecognizeScreenTextAsync(); // Future real call
+            string simulatedOcrText = "Simulated OCR: Player is facing 'Dragonlord Placidusax'. Health: 50%. Location: Crumbling Farum Azula.";
+
+            // --- Calling the AI Agent ---
+            string aiResponse = await GetAiResponseAsync(input, simulatedOcrText);
+
+            // --- Prepare HTML for WebView ---
+            string htmlContent;
+            bool isErrorResponse = string.IsNullOrEmpty(aiResponse) ||
+                                   aiResponse.StartsWith("Error:") ||
+                                   aiResponse.StartsWith("ADK Error:") ||
+                                   aiResponse.StartsWith("JSON Error:");
+
+            if (isErrorResponse)
+            {
+                string errorMessage = string.IsNullOrEmpty(aiResponse) ? "AI did not return a response." : aiResponse;
+                htmlContent = $"<html><head><meta charset=\"UTF-8\"></head><body><h3>Error:</h3><pre style='color:red;'>{WebUtility.HtmlEncode(errorMessage)}</pre></body></html>";
+            }
+            else
+            {
+                htmlContent = $"<html><head><meta charset=\"UTF-8\"></head><body><h3>Query:</h3><p>{WebUtility.HtmlEncode(input)}</p>";
+                if (!string.IsNullOrEmpty(simulatedOcrText))
+                {
+                     htmlContent += $"<h3>OCR Context:</h3><p><small>{WebUtility.HtmlEncode(simulatedOcrText)}</small></p>";
+                }
+                htmlContent += $"<h3>Response from ADK Agent:</h3><pre>{WebUtility.HtmlEncode(aiResponse)}</pre></body></html>";
+            }
+
+            // --- Simulated TTS Output ---
+            // Play TTS only for non-error responses and if enabled
+            if (!isErrorResponse && _enableVoiceOutput && !string.IsNullOrEmpty(aiResponse))
+            {
+                _ = SimulatePlayTextAsSpeechAsync(aiResponse);
+            }
+
+            // --- Displaying response in WebView2 ---
+            if (_currentContentPopup != null) { _currentContentPopup.Close(); _currentContentPopup = null; }
 
             var popup = new Window
             {
-                Title = $"Wiki",
-                Width = _settings.Popup.Width,
-                Height = _settings.Popup.Height,
-                Left = _settings.Popup.Left,
-                Top = _settings.Popup.Top,
-                Topmost = true,
-                WindowStartupLocation = WindowStartupLocation.Manual,
-                ShowInTaskbar = false
+                Title = isErrorResponse ? "AI Error" : "ADK AI Response",
+                Width = _settings.Popup.Width, Height = _settings.Popup.Height,
+                Left = _settings.Popup.Left, Top = _settings.Popup.Top,
+                Topmost = true, WindowStartupLocation = WindowStartupLocation.Manual, ShowInTaskbar = false
             };
-
-            // 1）准备容器和遮罩
             var container = new Grid();
             var webView = new WebView2 { Visibility = Visibility.Hidden };
-            var overlay = new Border
-            {
-                Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(180, 255, 255, 255)),
-                Child = new TextBlock
-                {
-                    Text = "正在加载…",
-                    FontSize = 16,
-                    FontWeight = FontWeights.Bold,
-                    HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center
-                }
-            };
+            var overlayTextBlock = new TextBlock { Text = "正在加载响应…", FontSize = 16, FontWeight = FontWeights.Bold, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+            var overlay = new Border { Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(180, 255, 255, 255)), Child = overlayTextBlock };
 
             container.Children.Add(webView);
             container.Children.Add(overlay);
             popup.Content = container;
-
-            // 2）马上弹窗，让用户有视觉反馈
             popup.Loaded += (_, __) => popup.Activate();
             popup.Show();
 
-            // 3）初始化 WebView2 内核
             await webView.EnsureCoreWebView2Async(_sharedEnvironment);
-
-            // 4）拦截新窗口、开始导航
-            webView.CoreWebView2.NewWindowRequested += (s, e) =>
-            {
-                e.Handled = true;
-                webView.CoreWebView2.Navigate(e.Uri);
-            };
-            webView.CoreWebView2.Navigate(uri.AbsoluteUri);
-
-            // 5）切换遮罩 & 内容可见性
-            webView.NavigationStarting += (s, e) =>
-            {
-                overlay.Visibility = Visibility.Visible;
-                webView.Visibility = Visibility.Hidden;
-            };
-            webView.NavigationCompleted += (s, e) =>
-            {
-                overlay.Visibility = Visibility.Collapsed;
-                webView.Visibility = Visibility.Visible;
-            };
-
-            // 关闭时保存最新位置与大小
+            webView.CoreWebView2.NewWindowRequested += (s, e) => { e.Handled = true; webView.CoreWebView2.Navigate(e.Uri); };
+            webView.CoreWebView2.NavigateToString(htmlContent);
+            webView.NavigationStarting += (s, e) => { overlay.Visibility = Visibility.Visible; webView.Visibility = Visibility.Hidden; };
+            webView.NavigationCompleted += (s, e) => { overlay.Visibility = Visibility.Collapsed; webView.Visibility = Visibility.Visible; };
             popup.Closed += (s, e) =>
             {
-                _settings.Popup.Left = popup.Left;
-                _settings.Popup.Top = popup.Top;
-                _settings.Popup.Width = popup.Width;
-                _settings.Popup.Height = popup.Height;
+                _settings.Popup.Left = popup.Left; _settings.Popup.Top = popup.Top;
+                _settings.Popup.Width = popup.Width; _settings.Popup.Height = popup.Height;
                 SaveSettings();
                 _currentContentPopup = null;
-                if (webView.CoreWebView2 != null)
-                {
-                    // 停止所有导航和媒体
-                    webView.CoreWebView2.Stop();
-                    // 强制释放底层资源
-                    webView.Dispose();
-                }
+                if (webView != null && webView.CoreWebView2 != null) { webView.CoreWebView2.Stop(); webView.Dispose(); }
             };
             _currentContentPopup = popup;
         }
@@ -455,205 +435,93 @@ namespace GameWikiTooltip
             if (!File.Exists(path))
             {
                 System.Windows.MessageBox.Show("缺少文件games.json,检查下载是否完全");
-                _gameConfigs = new Dictionary<string, GameConfig>(StringComparer.OrdinalIgnoreCase);
-                return;
+                _gameConfigs = new Dictionary<string, GameConfig>(StringComparer.OrdinalIgnoreCase); return;
             }
-
-            var doc = JsonDocument.Parse(File.ReadAllText(path));
-            _gameConfigs = new Dictionary<string, GameConfig>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var prop in doc.RootElement.EnumerateObject())
+            try
             {
-                if (prop.Value.ValueKind == JsonValueKind.Object)
+                var doc = JsonDocument.Parse(File.ReadAllText(path));
+                _gameConfigs = new Dictionary<string, GameConfig>(StringComparer.OrdinalIgnoreCase);
+                foreach (var prop in doc.RootElement.EnumerateObject())
                 {
-                    var cfg = prop.Value.Deserialize<GameConfig>();
-                    // 兼容：如果 searchTemplate 为空，就用默认 "{baseUrl}/{keyword}"
-                    if (cfg.NeedsSearch && string.IsNullOrWhiteSpace(cfg.SearchTemplate))
-                        cfg.SearchTemplate = "{baseUrl}/{keyword}";
-                    _gameConfigs[prop.Name] = cfg;
-                }
-                else if (prop.Value.ValueKind == JsonValueKind.String)
-                {
-                    // 向后兼容：简单 string 映射
-                    _gameConfigs[prop.Name] = new GameConfig
+                    if (prop.Value.ValueKind == JsonValueKind.Object)
                     {
-                        BaseUrl = prop.Value.GetString(),
-                        NeedsSearch = true,
-                        SearchTemplate = "{baseUrl}/{keyword}"
-                    };
+                        var gameCfg = prop.Value.Deserialize<GameConfig>();
+                        if (gameCfg.NeedsSearch && string.IsNullOrWhiteSpace(gameCfg.SearchTemplate)) gameCfg.SearchTemplate = "{baseUrl}/{keyword}";
+                        _gameConfigs[prop.Name] = gameCfg;
+                    }
+                    else if (prop.Value.ValueKind == JsonValueKind.String)
+                    {
+                        _gameConfigs[prop.Name] = new GameConfig { BaseUrl = prop.Value.GetString(), NeedsSearch = true, SearchTemplate = "{baseUrl}/{keyword}" };
+                    }
                 }
+            }
+            catch (JsonException ex)
+            {
+                 System.Windows.MessageBox.Show($"解析 games.json 失败: {ex.Message}\n将使用空配置。", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
+                _gameConfigs = new Dictionary<string, GameConfig>(StringComparer.OrdinalIgnoreCase);
             }
         }
-
         private string GetActiveWindowTitle()
         {
-            var sb = new StringBuilder(512);
-            IntPtr hwnd = GetForegroundWindow();
-            GetWindowText(hwnd, sb, sb.Capacity);
-            return sb.ToString();
+            const int nChars = 256;
+            StringBuilder buff = new StringBuilder(nChars);
+            IntPtr handle = GetForegroundWindow();
+            return GetWindowText(handle, buff, nChars) > 0 ? buff.ToString() : null;
         }
 
-        [DllImport("user32.dll")]
-        private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
-
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
     }
-    //搜索栏
+
     public static class Prompt
     {
-        //是否存在搜索栏
         private static Window _currentPrompt;
         public static Task<string> ShowDialogAsync(string placeholder = "输入关键词…")
         {
-            // 如果已有一个没关闭的，就激活它并直接返回 null（等用户自己关闭再下一次打开）
             if (_currentPrompt != null && _currentPrompt.IsVisible)
             {
                 _currentPrompt.Activate();
-                return null;
+                return Task.FromResult<string>(null);
             }
-
             var tcs = new TaskCompletionSource<string>();
-            bool lastClicked = false;
-            // 1. 新建无边框半透明窗体
             var prompt = new Window
             {
-                Width = 400,
-                Height = 100,
-                WindowStyle = WindowStyle.None,
-                AllowsTransparency = true,
-                Background = System.Windows.Media.Brushes.Transparent,
-                Opacity = 0.75,
-                Topmost = true,
-                ShowInTaskbar = false,
-                WindowStartupLocation = WindowStartupLocation.CenterScreen
+                Width = 400, Height = 100, WindowStyle = WindowStyle.None, AllowsTransparency = true,
+                Background = System.Windows.Media.Brushes.Transparent, Opacity = 0.85, Topmost = true,
+                ShowInTaskbar = false, WindowStartupLocation = WindowStartupLocation.CenterScreen
             };
-
-            // 记录到静态字段
             _currentPrompt = prompt;
-            // 关闭时清除
-            prompt.Closed += (_, __) => _currentPrompt = null;
-
-            // 失去焦点后延迟关闭，避免与DialogResult冲突
-            EventHandler deactivatedHandler = null;
-            deactivatedHandler = (s, e) =>
-            {
-                prompt.Deactivated -= deactivatedHandler;
-                // 延迟执行Close
-                prompt.Dispatcher.BeginInvoke((Action)(() =>
-                {
-                    if (prompt.IsVisible)
-                    {
-                        prompt.Close();
-                        tcs.TrySetResult(null);
-                    }
-                }), DispatcherPriority.Background);
-            };
-            prompt.Deactivated += deactivatedHandler;
-
-            // 当按 Esc 时，直接关闭对话框
-            prompt.PreviewKeyDown += (s, e) =>
-            {
-                if (e.Key == Key.Escape)
-                {
-                    prompt.Close();
-                    tcs.TrySetResult(null);
-                }
-            };
-
-            // 2. 圆角矩形 + 图标 + 输入框
-            var border = new Border
-            {
-                CornerRadius = new CornerRadius(8),
-                Background = System.Windows.Media.Brushes.White,
-                Padding = new Thickness(8)
-            };
-
+            prompt.Closed += (_, __) => { _currentPrompt = null; if (!tcs.Task.IsCompleted) tcs.TrySetResult(null); };
+            prompt.Deactivated += (s, e) => { if (prompt.IsVisible) prompt.Close(); };
+            prompt.PreviewKeyDown += (s, e) => { if (e.Key == Key.Escape) prompt.Close(); };
+            var border = new Border { CornerRadius = new CornerRadius(10), Background = new SolidColorBrush(System.Windows.Media.Color.FromArgb(240, 255, 255, 255)), Padding = new Thickness(10) };
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-            // 放大镜图标（Segoe MDL2 Assets 搜索图标 U+E721）
-            var icon = new TextBlock
-            {
-                FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"),
-                Text = "\uE721",
-                VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(0, 0, 8, 0)
-            };
+            var icon = new TextBlock { FontFamily = new System.Windows.Media.FontFamily("Segoe MDL2 Assets"), Text = "\uE721", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 10, 0), FontSize = 16 };
             Grid.SetColumn(icon, 0);
-
-            // 输入框
-            var input = new System.Windows.Controls.TextBox
-            {
-                Background = System.Windows.Media.Brushes.Transparent,
-                BorderThickness = new Thickness(0),
-                VerticalContentAlignment = VerticalAlignment.Center,
-                FontSize = 14,
-                Foreground = System.Windows.Media.Brushes.Black,
-                //如果你的 .NET 版本支持 PlaceholderText：
-                //PlaceholderText        = placeholder
-            };
-            Grid.SetColumn(input, 1);
-
-            // 回车提交
-            input.KeyDown += (s, e) =>
-            {
-                if (e.Key == Key.Enter)
-                {
-                    prompt.Close();
-                    tcs.TrySetResult(input.Text);
-                }
-                else if (e.Key == Key.Escape)
-                {
-                    prompt.Close();
-                    tcs.TrySetResult(null);
-                }
-            };
-
+            var inputTextBox = new System.Windows.Controls.TextBox { Background = Brushes.Transparent, BorderThickness = new Thickness(0), VerticalContentAlignment = VerticalAlignment.Center, FontSize = 16, Foreground = Brushes.Black, Text = "" };
+            var placeholderAdorner = new TextBlock { Text = placeholder, Foreground = Brushes.Gray, IsHitTestVisible = false, Visibility = Visibility.Collapsed, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2,0,0,0) };
+            if(string.IsNullOrEmpty(inputTextBox.Text)) placeholderAdorner.Visibility = Visibility.Visible;
+            inputTextBox.TextChanged += (s,e) => { placeholderAdorner.Visibility = string.IsNullOrEmpty(inputTextBox.Text) ? Visibility.Visible : Visibility.Collapsed; };
+            var inputGrid = new Grid();
+            inputGrid.Children.Add(inputTextBox);
+            inputGrid.Children.Add(placeholderAdorner);
+            Grid.SetColumn(inputGrid, 1);
             grid.Children.Add(icon);
-            grid.Children.Add(input);
+            grid.Children.Add(inputGrid);
             border.Child = grid;
-
-            // “打开上次搜索内容”按钮
-            var lastBtn = new System.Windows.Controls.Button
-            {
-                Content = "打开上次搜索内容",
-                Opacity = 0.9,
-                Background = System.Windows.Media.Brushes.White,
-                BorderBrush = System.Windows.Media.Brushes.Transparent,
-                Height = 30,                      // 挺高一点
-                Width = 110,                     // 足够宽
-                FontSize = 10,                      // 文本更大
-                Padding = new Thickness(10, 5, 10, 5),  // 文本四周留白
-                HorizontalAlignment = System.Windows.HorizontalAlignment.Center,
-                Margin = new Thickness(0, 4, 0, 0) // 上方留点间距
-            };
-            lastBtn.Click += (s, e) =>
-            {
-                lastClicked = true;
-                prompt.Close();
-                tcs.TrySetResult("<<LAST>>");
-            };
-
-            // 布局
+            inputTextBox.KeyDown += (s, e) => { if (e.Key == Key.Enter) { prompt.Close(); tcs.TrySetResult(inputTextBox.Text); }};
+            var lastBtn = new System.Windows.Controls.Button { Content = "打开上次内容", Opacity = 0.9, Background = Brushes.LightGray, BorderBrush = Brushes.DarkGray, BorderThickness = new Thickness(1), Height = 30, Width = 120, FontSize = 11, Padding = new Thickness(8), HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 8, 0, 0) };
+            lastBtn.Click += (s, e) => { prompt.Close(); tcs.TrySetResult("<<LAST>>"); };
             var panel = new StackPanel();
             panel.Children.Add(border);
             panel.Children.Add(lastBtn);
             prompt.Content = panel;
-
-            // 确保获得焦点
-            prompt.Loaded += (_, __) =>
-            {
-                prompt.Activate();
-                input.Focus();
-            };
-            // 弹出 Modeless 窗口
+            prompt.Loaded += (_, __) => { prompt.Activate(); inputTextBox.Focus(); };
             prompt.Show();
-
             return tcs.Task;
         }
     }
