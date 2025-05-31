@@ -1,0 +1,57 @@
+# Visual Studio cache files
+.vs/
+
+# Build results
+[Bb]in/
+[Oo]bj/
+
+# User specific files
+*.user
+*.suo
+
+# Rider specific files
+.idea/
+
+# Secrets and local configurations - if you have any such files
+# local.settings.json
+
+# Publish folder
+publish/
+
+# Rider auto-generated files
+*_i.c
+*_p.c
+*_i.h
+*_p.h
+
+# Rider cache files
+.idea/.idea.GameWikiOverlay/.idea/
+.idea/.idea.GameWikiOverlay.dir/.idea/
+
+# NuGet packages folder - if not using PackageReference
+packages/
+
+# Windows thumbnail cache
+Thumbs.db
+
+# Files built by Visual Studio
+*.obj
+*.exe
+*.pdb
+*.dll
+*.cache
+*.sbr
+*_i.c
+*_p.c
+*.ncb
+*.ilk
+*.log
+*.tlog
+*.manifest
+*.rsp
+
+# Test results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+*.VisualState.xml
+TestResult.xml
